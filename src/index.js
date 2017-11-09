@@ -77,12 +77,14 @@ export default class CSSSplitWebpackPlugin {
     imports = false,
     filename = '[name]-[part].[ext]',
     preserve,
+    listenForEmit = false
   }) {
     this.options = {
       size,
       imports: normalizeImports(imports, preserve),
       filename: nameInterpolator(filename),
       preserve,
+      listenForEmit
     };
   }
 
@@ -114,9 +116,46 @@ export default class CSSSplitWebpackPlugin {
           return new SourceMapSource(
             css,
             name(i),
-            map.toString()
+            map && map.toString()
           );
         }),
+      });
+    });
+  }
+  
+  mappingChunks(chunks, assets, publicPath) {
+    return chunks.map((chunk) => {
+      const input = chunk.files.filter(isCSS);
+      const items = input.map((name) => this.file(name, assets[name]));
+      return Promise.all(items).then((entries) => {
+        entries.forEach((entry) => {
+          // Skip the splitting operation for files that result in no
+          // split occuring.
+          if (entry.chunks.length === 1) {
+            return;
+          }
+          // Inject the new files into the chunk.
+          entry.chunks.forEach((file) => {
+            assets[file._name] = file;
+            chunk.files.push(file._name);
+          });
+          const content = entry.chunks.map((file) => {
+            return `@import "${publicPath}/${file._name}";`;
+          }).join('\n');
+          const imports = this.options.imports({
+            ...entry,
+            content,
+          });
+          if (!this.options.preserve) {
+            chunk.files.splice(chunk.files.indexOf(entry.file), 1);
+            delete assets[entry.file];
+          }
+          if (imports) {
+            assets[imports] = new RawSource(content);
+            chunk.files.push(imports);
+          }
+        });
+        return Promise.resolve();
       });
     });
   }
@@ -132,50 +171,31 @@ export default class CSSSplitWebpackPlugin {
    * @returns {void}
    */
   apply(compiler : Object) {
+    // listenForEmit: true
+    // Run on `emit` to avoid css optimization happens after css split
+    // listenForEmit: false
     // Only run on `this-compilation` to avoid injecting the plugin into
     // sub-compilers as happens when using the `extract-text-webpack-plugin`.
-    compiler.plugin('this-compilation', (compilation) => {
-      const assets = compilation.assets;
-      const publicPath = strip(compilation.options.output.publicPath || './');
-      compilation.plugin('after-optimize-chunk-assets', (chunks, done) => {
-        const promises = chunks.map((chunk) => {
-          const input = chunk.files.filter(isCSS);
-          const items = input.map((name) => this.file(name, assets[name]));
-          return Promise.all(items).then((entries) => {
-            entries.forEach((entry) => {
-              // Skip the splitting operation for files that result in no
-              // split occuring.
-              if (entry.chunks.length === 1) {
-                return;
-              }
-              // Inject the new files into the chunk.
-              entry.chunks.forEach((file) => {
-                assets[file._name] = file;
-                chunk.files.push(file._name);
-              });
-              const content = entry.chunks.map((file) => {
-                return `@import "${publicPath}/${file._name}";`;
-              }).join('\n');
-              const imports = this.options.imports({
-                ...entry,
-                content,
-              });
-              if (!this.options.preserve) {
-                chunk.files.splice(chunk.files.indexOf(entry.file), 1);
-                delete assets[entry.file];
-              }
-              if (imports) {
-                assets[imports] = new RawSource(content);
-                chunk.files.push(imports);
-              }
-            });
-            return Promise.resolve();
-          });
-        });
+    if(this.options.listenForEmit) {
+      compiler.plugin('emit', (compilation, done) => {
+        const assets = compilation.assets;
+        const publicPath = strip(compilation.options.output.publicPath || './');
+        const chunks = compilation.chunks;
+        const promises = this.mappingChunks(chunks, assets, publicPath);
         Promise.all(promises).then(() => {
           done();
         }, done);
       });
-    });
+    } else {
+      compiler.plugin('this-compilation', (compilation) => {
+        const assets = compilation.assets;
+        const publicPath = strip(compilation.options.output.publicPath || './');
+        
+        compilation.plugin('after-optimize-chunk-assets', (chunks) => {
+          const promises = this.mappingChunks(chunks, assets, publicPath);
+          Promise.resolve(promises);
+        });
+      });
+    }  
   }
 }
